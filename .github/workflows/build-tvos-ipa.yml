@@ -1,0 +1,155 @@
+name: Build unsigned tvOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build/tvos-ipa
+    paths:
+      - .github/workflows/build-tvos-ipa.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tvos-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-tvos-ipa:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      DERIVED_DATA: ${{ runner.temp }}/SmartTubeDerivedData
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode and show SDKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d /Applications/Xcode_26.6.app ]]; then
+            XCODE=/Applications/Xcode_26.6.app
+          else
+            XCODE="$(find /Applications -maxdepth 1 -type d -name 'Xcode_*.app' | sort -V | tail -1)"
+          fi
+          if [[ -z "${XCODE:-}" || ! -d "$XCODE" ]]; then
+            echo "No Xcode installation found"
+            ls -la /Applications | grep -i Xcode || true
+            exit 1
+          fi
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Prepare fork-safe build configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp SmartTubeApp/Config/Secrets.xcconfig.example SmartTubeApp/Config/Secrets.xcconfig
+
+          # The upstream Xcode project expects GoogleService-Info.plist as a build
+          # resource. For this unsigned CI build we generate a non-secret placeholder.
+          # It is not committed and is only intended to prove/build the tvOS artifact.
+          for dir in "SmartTubeApp/Smart Tube" "SmartTubeApp/SmartTubeApp"; do
+            mkdir -p "$dir"
+            cat > "$dir/GoogleService-Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>API_KEY</key><string>SELF_BUILD_DISABLED</string>
+            <key>GCM_SENDER_ID</key><string>000000000000</string>
+            <key>PLIST_VERSION</key><string>1</string>
+            <key>BUNDLE_ID</key><string>com.void.smarttube</string>
+            <key>PROJECT_ID</key><string>smarttube-self-build</string>
+            <key>STORAGE_BUCKET</key><string>smarttube-self-build.invalid</string>
+            <key>IS_ADS_ENABLED</key><false/>
+            <key>IS_ANALYTICS_ENABLED</key><false/>
+            <key>IS_APPINVITE_ENABLED</key><false/>
+            <key>IS_GCM_ENABLED</key><false/>
+            <key>IS_SIGNIN_ENABLED</key><false/>
+            <key>GOOGLE_APP_ID</key><string>1:000000000000:ios:0000000000000000</string>
+          </dict>
+          </plist>
+          PLIST
+            plutil -lint "$dir/GoogleService-Info.plist"
+          done
+
+      - name: Resolve Swift packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -workspace SmartTube.xcworkspace \
+            -scheme "Smart Tube"
+
+      - name: Build unsigned tvOS device app
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          xcodebuild build \
+            -workspace SmartTube.xcworkspace \
+            -scheme "Smart Tube" \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            DEVELOPMENT_TEAM='' \
+            | tee "$RUNNER_TEMP/tvos-build.log"
+
+      - name: Package IPA
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH="$DERIVED_DATA/Build/Products/Release-appletvos/Smart Tube.app"
+          if [[ ! -d "$APP_PATH" ]]; then
+            echo "Expected app not found at: $APP_PATH"
+            find "$DERIVED_DATA/Build/Products" -maxdepth 3 -name '*.app' -print || true
+            exit 1
+          fi
+
+          OUT="$RUNNER_TEMP/SmartTubeIPA"
+          mkdir -p "$OUT/Payload"
+          ditto "$APP_PATH" "$OUT/Payload/Smart Tube.app"
+
+          BIN="$OUT/Payload/Smart Tube.app/Smart Tube"
+          echo "Binary information:"
+          file "$BIN"
+          lipo -info "$BIN" || true
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IPA="SmartTube-tvOS-${SHORT_SHA}.ipa"
+          (
+            cd "$OUT"
+            /usr/bin/zip -qry "$IPA" Payload
+          )
+
+          echo "ipa=$OUT/$IPA" >> "$GITHUB_OUTPUT"
+          echo "name=$IPA" >> "$GITHUB_OUTPUT"
+          ls -lh "$OUT/$IPA"
+
+      - name: Upload unsigned tvOS IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartTube-tvOS-${{ github.sha }}
+          path: ${{ steps.package.outputs.ipa }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tvos-build-log-${{ github.sha }}
+          path: ${{ runner.temp }}/tvos-build.log
+          if-no-files-found: ignore
+          retention-days: 7
