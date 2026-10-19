@@ -19,8 +19,6 @@ jobs:
   build-tvos-ipa:
     runs-on: macos-15
     timeout-minutes: 60
-    env:
-      DERIVED_DATA: ${{ runner.temp }}/SmartTubeDerivedData
 
     steps:
       - name: Checkout
@@ -82,6 +80,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          DERIVED_DATA="$RUNNER_TEMP/SmartTubeDerivedData"
           xcodebuild build \
             -workspace SmartTube.xcworkspace \
             -scheme "Smart Tube" \
@@ -100,6 +99,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          DERIVED_DATA="$RUNNER_TEMP/SmartTubeDerivedData"
           APP_PATH="$DERIVED_DATA/Build/Products/Release-appletvos/Smart Tube.app"
           if [[ ! -d "$APP_PATH" ]]; then
             echo "Expected app not found at: $APP_PATH"
