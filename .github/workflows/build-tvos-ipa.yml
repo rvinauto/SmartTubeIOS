@@ -99,6 +99,44 @@ jobs:
             DEVELOPMENT_TEAM='' \
             | tee "$RUNNER_TEMP/tvos-build.log"
 
+      - name: Build and embed Top Shelf extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          DERIVED_DATA="$RUNNER_TEMP/SmartTubeDerivedData"
+          APP_PATH="$DERIVED_DATA/Build/Products/Release-appletvos/Smart Tube.app"
+          APPEX="$APP_PATH/PlugIns/SmartTubeTopShelf.appex"
+          SDKROOT="$(xcrun --sdk appletvos --show-sdk-path)"
+
+          test -d "$APP_PATH"
+          mkdir -p "$APPEX"
+          ditto SmartTubeApp/TopShelf/Info.plist "$APPEX/Info.plist"
+
+          APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Info.plist")"
+          APP_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Info.plist")"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$APPEX/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_BUILD" "$APPEX/Info.plist"
+
+          xcrun --sdk appletvos swiftc \
+            -O \
+            -parse-as-library \
+            -application-extension \
+            -target arm64-apple-tvos17.6 \
+            -sdk "$SDKROOT" \
+            -module-name SmartTubeTopShelf \
+            SmartTubeApp/TopShelf/ContentProvider.swift \
+            -framework Foundation \
+            -framework TVServices \
+            -Xlinker -e -Xlinker _NSExtensionMain \
+            -Xlinker -application_extension \
+            -o "$APPEX/SmartTubeTopShelf"
+
+          plutil -lint "$APPEX/Info.plist"
+          file "$APPEX/SmartTubeTopShelf"
+          otool -L "$APPEX/SmartTubeTopShelf"
+          echo "Embedded Top Shelf extension:"
+          find "$APPEX" -maxdepth 1 -type f -print
+
       - name: Package IPA
         id: package
         shell: bash
@@ -112,6 +150,11 @@ jobs:
             exit 1
           fi
 
+          APPEX="$APP_PATH/PlugIns/SmartTubeTopShelf.appex"
+          test -x "$APPEX/SmartTubeTopShelf"
+          test -f "$APPEX/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' "$APPEX/Info.plist"
+
           OUT="$RUNNER_TEMP/SmartTubeIPA"
           mkdir -p "$OUT/Payload"
           ditto "$APP_PATH" "$OUT/Payload/Smart Tube.app"
@@ -119,9 +162,10 @@ jobs:
           BIN="$OUT/Payload/Smart Tube.app/Smart Tube"
           file "$BIN"
           lipo -info "$BIN" || true
+          find "$OUT/Payload/Smart Tube.app/PlugIns" -maxdepth 2 -print
 
           SHORT_SHA="${GITHUB_SHA::7}"
-          IPA="SmartTube-tvOS-no-firebase-${SHORT_SHA}.ipa"
+          IPA="SmartTube-tvOS-top-shelf-${SHORT_SHA}.ipa"
           (
             cd "$OUT"
             /usr/bin/zip -qry "$IPA" Payload
@@ -134,7 +178,7 @@ jobs:
       - name: Upload unsigned tvOS IPA
         uses: actions/upload-artifact@v4
         with:
-          name: SmartTube-tvOS-no-firebase-${{ github.sha }}
+          name: SmartTube-tvOS-top-shelf-${{ github.sha }}
           path: ${{ steps.package.outputs.ipa }}
           if-no-files-found: error
           retention-days: 14
