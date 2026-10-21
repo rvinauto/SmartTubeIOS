@@ -35,6 +35,12 @@ public final class SettingsStore {
     public var useTOSPlayerOnIOS: Bool = true
 
     private static let key = "smarttube_app_settings"
+    #if os(tvOS)
+    /// One-time fork migration: keep Shorts visible by default on Apple TV, including
+    /// devices upgrading from an older build that had either hide toggle enabled.
+    /// Users can still change both toggles afterwards; this migration runs only once.
+    private static let shortsVisibilityMigrationKey = "rvinauto_tvos_shorts_visible_v1"
+    #endif
 
     public init() {
         if let data = UserDefaults.standard.data(forKey: Self.key),
@@ -44,6 +50,16 @@ public final class SettingsStore {
         } else {
             self.settings = AppSettings()
         }
+
+        #if os(tvOS)
+        if !UserDefaults.standard.bool(forKey: Self.shortsVisibilityMigrationKey) {
+            self.settings.hideShorts = false
+            self.settings.hideLiveShorts = false
+            UserDefaults.standard.set(true, forKey: Self.shortsVisibilityMigrationKey)
+            self.save()
+        }
+        #endif
+
         // Reset settings to defaults when launched for UI testing so each test
         // suite starts from a clean, known state and prior runs cannot bleed in.
         if ProcessInfo.processInfo.arguments.contains("--uitesting-reset-settings") {
