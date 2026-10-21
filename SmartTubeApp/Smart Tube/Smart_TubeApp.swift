@@ -9,7 +9,7 @@ import SwiftUI
 /// the user reads a code on screen and activates on their phone at yt.be/activate.
 @main
 struct SmartTubeTVApp: App {
-    // Declared without default values so that init() can call FirebaseApp.configure()
+    // Declared without default values so that init() can prepare dependencies
     // before any of these objects are instantiated.
     @State private var api: InnerTubeAPI
     @State private var authService: AuthService
@@ -24,13 +24,14 @@ struct SmartTubeTVApp: App {
     #endif
 
     init() {
-        // #92: see AppEntry.swift's init() for why order matters here — settingsStore
-        // must exist before deciding whether to configure Firebase at all.
+        // Fork/self-build: disable Firebase/Crashlytics at startup. The CI build uses
+        // a placeholder GoogleService-Info.plist only to satisfy the Xcode resource
+        // requirement, so calling FirebaseApp.configure() here can make a sideloaded
+        // tvOS build fail immediately at launch. YouTube auth/playback do not depend
+        // on Crashlytics.
         let settingsStore = SettingsStore()
-        CrashlyticsLogger.isEnabled = !settingsStore.settings.disableAnalytics
-        if CrashlyticsLogger.isEnabled {
-            FirebaseApp.configure()
-        }
+        CrashlyticsLogger.isEnabled = false
+
         let poTokenProvider: (any PoTokenProvider)? = {
             if let url = settingsStore.settings.poTokenServiceURL {
                 return ServerPoTokenProvider(serviceURL: url)
