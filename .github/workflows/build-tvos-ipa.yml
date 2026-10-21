@@ -5,8 +5,6 @@ on:
   push:
     branches:
       - build/tvos-ipa
-    paths:
-      - .github/workflows/build-tvos-ipa.yml
 
 permissions:
   contents: read
@@ -123,7 +121,7 @@ jobs:
           lipo -info "$BIN" || true
 
           SHORT_SHA="${GITHUB_SHA::7}"
-          IPA="SmartTube-tvOS-${SHORT_SHA}.ipa"
+          IPA="SmartTube-tvOS-no-firebase-${SHORT_SHA}.ipa"
           (
             cd "$OUT"
             /usr/bin/zip -qry "$IPA" Payload
@@ -136,7 +134,7 @@ jobs:
       - name: Upload unsigned tvOS IPA
         uses: actions/upload-artifact@v4
         with:
-          name: SmartTube-tvOS-${{ github.sha }}
+          name: SmartTube-tvOS-no-firebase-${{ github.sha }}
           path: ${{ steps.package.outputs.ipa }}
           if-no-files-found: error
           retention-days: 14
