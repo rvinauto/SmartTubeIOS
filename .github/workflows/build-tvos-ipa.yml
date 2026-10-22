@@ -73,6 +73,12 @@ jobs:
           plutil -lint "SmartTubeApp/Smart Tube/GoogleService-Info.plist"
           plutil -lint "SmartTubeApp/SmartTubeApp/GoogleService-Info.plist"
 
+      - name: Complete Simplified Chinese localization
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/patch_zh_hans_localization.py
+
       - name: Resolve Swift packages
         shell: bash
         run: |
