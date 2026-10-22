@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - build/tvos-ipa
+      - feature/tvos-youtube-ui
 
 permissions:
   contents: read
@@ -78,6 +79,13 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/patch_zh_hans_localization.py
+
+      - name: Apply YouTube TV UI and metadata locale overlay
+        if: github.ref == 'refs/heads/feature/tvos-youtube-ui'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/patch_tvos_youtube_ui.py
 
       - name: Resolve Swift packages
         shell: bash
