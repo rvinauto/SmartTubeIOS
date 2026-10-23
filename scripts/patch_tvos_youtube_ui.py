@@ -485,4 +485,525 @@ else:
     print("TV metadata locale: already applied")
 
 INNER_TUBE.write_text(api, encoding="utf-8")
+
+# ---------------------------------------------------------------------------------------
+# tvOS 4K experiment (approved): only active on tvOS when the requested quality is >1080p.
+# Default / <=1080p paths are untouched. All diagnostics are logged with the `[4k-exp]` prefix.
+# ---------------------------------------------------------------------------------------
+CORE_DIR = ROOT / "SmartTubeIOS/Sources/SmartTubeIOSCore"
+UI_DIR = ROOT / "SmartTubeIOS/Sources/SmartTubeIOS"
+HLS_PARSER = CORE_DIR / "HLSManifestParser.swift"
+FALLBACK = UI_DIR / "ViewModels/PlaybackViewModel+Fallback.swift"
+PLAYER_LIFECYCLE = UI_DIR / "Views/Player/PlayerView+Lifecycle.swift"
+
+(CORE_DIR / "TVFourKExperiment.swift").write_text(r"""import Foundation
+import os
+#if canImport(VideoToolbox)
+import CoreMedia
+import VideoToolbox
+#endif
+
+/// tvOS-only 4K playback experiment. Active only when the requested quality is above 1080p.
+public enum TVFourKExperiment {
+    /// Sentinel passed as `requiredVideoCodec` to the HLS master filter: keep every codec
+    /// except AV1 when the device cannot hardware-decode AV1.
+    public static let excludeUnsupportedAV1Codec = "!4kexp-no-unsupported-av01"
+    /// Height cap used by the HLS proxy filter while the experiment is active (effectively none).
+    public static let uncappedHeight = 4320
+
+    private static let logger = Logger(subsystem: "com.void.smarttube", category: "4k-exp")
+
+    public static func isActive(requestedMaxHeight: Int?) -> Bool {
+        #if os(tvOS)
+        guard let h = requestedMaxHeight else { return false }
+        return h > 1080
+        #else
+        return false
+        #endif
+    }
+
+    public static let av1HardwareDecodeSupported: Bool = {
+        #if canImport(VideoToolbox)
+        return VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
+        #else
+        return false
+        #endif
+    }()
+
+    nonisolated(unsafe) public static var lastClientLabel: String = ""
+
+    public static func log(_ message: String) {
+        logger.notice("[4k-exp] \(message, privacy: .public)")
+        print("[4k-exp] \(message)")
+    }
+
+    /// Codec gate for an HLS `#EXT-X-STREAM-INF` line / codecs string.
+    public static func isVariantCodecAllowed(_ codecs: String) -> Bool {
+        if codecs.localizedCaseInsensitiveContains("av01") { return av1HardwareDecodeSupported }
+        return true
+    }
+
+    /// Option 2: on tvOS hide AV1 formats above 1080p when AV1 cannot be hardware decoded.
+    public static func isFormatDecodable(height: Int, mimeType: String) -> Bool {
+        #if os(tvOS)
+        if height > 1080, mimeType.contains("av01"), !av1HardwareDecodeSupported { return false }
+        #endif
+        return true
+    }
+
+    /// Human-readable list of master manifest variants (resolution / codecs / bandwidth).
+    public static func describeVariants(_ manifest: String) -> [String] {
+        var out: [String] = []
+        for raw in manifest.components(separatedBy: .newlines) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("#EXT-X-STREAM-INF") else { continue }
+            let res = line.range(of: #"RESOLUTION=[0-9x]+"#, options: .regularExpression).map { String(line[$0]) } ?? "RESOLUTION=?"
+            let codecs = line.range(of: #"CODECS="[^"]*""#, options: .regularExpression).map { String(line[$0]) } ?? "CODECS=?"
+            let bw = line.range(of: #"BANDWIDTH=[0-9]+"#, options: .regularExpression).map { String(line[$0]) } ?? "BANDWIDTH=?"
+            let allowed = isVariantCodecAllowed(codecs) ? "ok" : "dropped(av01 no HW)"
+            out.append("\(res) \(codecs) \(bw) \(allowed)")
+        }
+        return out
+    }
+}
+
+/// 4K-experiment variant of `parseHLSMasterManifest`: heights above 1080p prefer VP9, then
+/// HEVC, then AV1 (only with hardware decode); <=1080p keeps H.264 first. Unsupported AV1 is dropped.
+public func parseHLSMasterManifestFourK(_ manifestText: String, baseURL: URL) -> [Int: URL] {
+    var variants: [Int: URL] = [:]
+    var ranks: [Int: Int] = [:]
+    var pendingHeight: Int? = nil
+    var pendingCodecs: String = ""
+    func rank(_ codecs: String, height: Int) -> Int {
+        let c = codecs.lowercased()
+        if height > 1080 {
+            if c.contains("vp09") { return 0 }
+            if c.contains("hvc1") || c.contains("hev1") { return 1 }
+            if c.contains("av01") { return 2 }
+            return 3
+        }
+        if c.contains("avc1") { return 0 }
+        if c.contains("vp09") { return 1 }
+        return 2
+    }
+    for line in manifestText.components(separatedBy: .newlines) {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("#EXT-X-STREAM-INF") {
+            pendingHeight = nil
+            pendingCodecs = trimmed.range(of: #"CODECS="[^"]*""#, options: .regularExpression).map { String(trimmed[$0]) } ?? ""
+            if let r = trimmed.range(of: #"RESOLUTION=\d+x(\d+)"#, options: .regularExpression),
+                let h = String(trimmed[r]).components(separatedBy: "x").last.flatMap({ Int($0) })
+            {
+                pendingHeight = h
+            }
+        } else if !trimmed.hasPrefix("#"), !trimmed.isEmpty, let height = pendingHeight {
+            let url: URL? = trimmed.hasPrefix("http")
+                ? URL(string: trimmed)
+                : URL(string: trimmed, relativeTo: baseURL).map { $0.absoluteURL }
+            if let url, TVFourKExperiment.isVariantCodecAllowed(pendingCodecs) {
+                let r = rank(pendingCodecs, height: height)
+                if let existing = ranks[height], existing <= r {
+                    // keep better-ranked variant
+                } else {
+                    variants[height] = url
+                    ranks[height] = r
+                }
+            }
+            pendingHeight = nil
+            pendingCodecs = ""
+        } else if trimmed.hasPrefix("#") {
+            pendingHeight = nil
+        }
+    }
+    return variants
+}
+""", encoding="utf-8")
+print("tvOS 4K experiment core helper: written")
+
+(UI_DIR / "Views/Player/TVFourKDebug.swift").write_text(r"""#if os(tvOS)
+import AVFoundation
+import CoreMedia
+import SmartTubeIOSCore
+import SwiftUI
+
+/// Runtime monitor for the tvOS 4K experiment. Logs with `[4k-exp]` and feeds the overlay.
+@MainActor
+enum TVFourKMonitor {
+    /// HLS config (maxHeight, requiredCodec) saved before a 4K quality switch so a later
+    /// <=1080p selection restores the exact previous behaviour.
+    static var savedHLSConfig: (maxHeight: Int?, codec: String?)? = nil
+    static var lastError: String = ""
+
+    static func videoCodec(_ item: AVPlayerItem) -> String {
+        for track in item.tracks {
+            guard let asset = track.assetTrack, asset.mediaType == .video else { continue }
+            for raw in asset.formatDescriptions {
+                let desc = raw as! CMFormatDescription
+                let code = CMFormatDescriptionGetMediaSubType(desc)
+                let chars: [UInt8] = [
+                    UInt8((code >> 24) & 0xFF), UInt8((code >> 16) & 0xFF),
+                    UInt8((code >> 8) & 0xFF), UInt8(code & 0xFF),
+                ]
+                return String(bytes: chars, encoding: .ascii) ?? "?"
+            }
+        }
+        return "?"
+    }
+
+    static func describe(_ item: AVPlayerItem?) -> String {
+        guard let item else { return "no item" }
+        let size = item.presentationSize
+        let event = item.accessLog()?.events.last
+        let indicated = Int((event?.indicatedBitrate ?? 0) / 1000)
+        let observed = Int((event?.observedBitrate ?? 0) / 1000)
+        let uri = event?.uri.map { String($0.suffix(60)) } ?? "-"
+        return "size=\(Int(size.width))x\(Int(size.height)) codec=\(videoCodec(item)) indicated=\(indicated)kbps observed=\(observed)kbps uri=…\(uri)"
+    }
+
+    static func attach(to item: AVPlayerItem, context: String) {
+        TVFourKExperiment.log(
+            "attach context=\(context) client=\(TVFourKExperiment.lastClientLabel) av1HW=\(TVFourKExperiment.av1HardwareDecodeSupported) maxRes=\(Int(item.preferredMaximumResolution.width))x\(Int(item.preferredMaximumResolution.height)) peak=\(Int(item.preferredPeakBitRate / 1000))kbps"
+        )
+        lastError = ""
+        Task { @MainActor [weak item] in
+            var reportedError = false
+            for tick in 0..<24 {
+                try? await Task.sleep(for: .seconds(5))
+                guard let item else { return }
+                TVFourKExperiment.log("[\(context)] t=\((tick + 1) * 5)s status=\(item.status.rawValue) \(describe(item))")
+                if !reportedError {
+                    if let err = item.error {
+                        lastError = "\(err)"
+                        TVFourKExperiment.log("[\(context)] item.error=\(err)")
+                        reportedError = true
+                    } else if let ev = item.errorLog()?.events.last {
+                        lastError = "\(ev.errorDomain) \(ev.errorStatusCode) \(ev.errorComment ?? "")"
+                        TVFourKExperiment.log("[\(context)] errorLog: \(lastError)")
+                        reportedError = true
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Small on-screen debug text shown in the player only while the 4K experiment is active.
+struct TVFourKDebugOverlay: View {
+    let player: AVPlayer
+    let requestedMaxHeight: Int?
+
+    var body: some View {
+        if TVFourKExperiment.isActive(requestedMaxHeight: requestedMaxHeight) {
+            TimelineView(.periodic(from: .now, by: 1.0)) { _ in
+                let text: String = overlayText()
+                Text(text)
+                    .font(.system(size: 18, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color.yellow)
+                    .padding(10)
+                    .background(Color.black.opacity(0.65))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            .padding(40)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+    }
+
+    private func overlayText() -> String {
+        let req: String = requestedMaxHeight.map { "\($0)p" } ?? "auto"
+        var lines: [String] = []
+        lines.append("[4k-exp] req=\(req) client=\(TVFourKExperiment.lastClientLabel)")
+        lines.append(TVFourKMonitor.describe(player.currentItem))
+        lines.append("AV1 HW=\(TVFourKExperiment.av1HardwareDecodeSupported ? "yes" : "no")")
+        if !TVFourKMonitor.lastError.isEmpty {
+            lines.append("err=\(String(TVFourKMonitor.lastError.prefix(120)))")
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+#endif
+""", encoding="utf-8")
+print("tvOS 4K experiment monitor/overlay: written")
+
+# HLS master filter: support the "drop unsupported AV1 only" sentinel.
+replace_once(
+    HLS_PARSER,
+    "            let codecMatches = trimmed.localizedCaseInsensitiveContains(requiredVideoCodec)\n",
+    "            let codecMatches: Bool =\n"
+    "                requiredVideoCodec == TVFourKExperiment.excludeUnsupportedAV1Codec\n"
+    "                ? TVFourKExperiment.isVariantCodecAllowed(trimmed)\n"
+    "                : trimmed.localizedCaseInsensitiveContains(requiredVideoCodec)\n",
+    "4k-exp HLS master filter sentinel",
+)
+
+# Initial load: relax HLS policy only in 4K mode.
+replace_once(
+    FALLBACK,
+    "        let hlsPolicy = HLSPlaybackPolicy.resolve(label: label, isHLS: isHLSManifest)\n",
+    """        let basePolicy = HLSPlaybackPolicy.resolve(label: label, isHLS: isHLSManifest)
+        let fourKActive: Bool = isHLSManifest && TVFourKExperiment.isActive(requestedMaxHeight: effectiveQuality.maxHeight)
+        let hlsPolicy: HLSPlaybackPolicy =
+            fourKActive
+            ? HLSPlaybackPolicy(
+                userAgent: basePolicy.userAgent,
+                maximumHeight: nil,
+                filtersMasterManifest: basePolicy.filtersMasterManifest,
+                requiresH264: false
+            )
+            : basePolicy
+        if fourKActive {
+            TVFourKExperiment.lastClientLabel = label
+            TVFourKExperiment.log(
+                "attemptURL client=\\(label) requested=\\(effectiveQuality.maxHeight ?? 0)p base(maxH=\\(basePolicy.maximumHeight ?? 0) h264=\\(basePolicy.requiresH264)) → relaxed (no cap, no H.264 requirement, av1HW=\\(TVFourKExperiment.av1HardwareDecodeSupported))"
+            )
+        }
+""",
+    "4k-exp relaxed HLS policy",
+)
+replace_once(
+    FALLBACK,
+    """            qualityManager.configureHLSPlayback(
+                userAgent: hlsPolicy.userAgent,
+                maximumHeight: hlsPolicy.maximumHeight,
+                requiredVideoCodec: hlsPolicy.requiresH264 ? "avc1" : nil
+            )
+""",
+    """            if fourKActive {
+                qualityManager.configureHLSPlayback(
+                    userAgent: hlsPolicy.userAgent,
+                    maximumHeight: TVFourKExperiment.uncappedHeight,
+                    requiredVideoCodec: TVFourKExperiment.excludeUnsupportedAV1Codec
+                )
+            } else {
+                qualityManager.configureHLSPlayback(
+                    userAgent: hlsPolicy.userAgent,
+                    maximumHeight: hlsPolicy.maximumHeight,
+                    requiredVideoCodec: hlsPolicy.requiresH264 ? "avc1" : nil
+                )
+            }
+""",
+    "4k-exp HLS proxy config",
+)
+replace_once(
+    FALLBACK,
+    """        player.replaceCurrentItem(with: item)
+        itemObserverTask?.cancel()
+
+        for await status in item.statusStream {
+""",
+    """        player.replaceCurrentItem(with: item)
+        #if os(tvOS)
+        if fourKActive { TVFourKMonitor.attach(to: item, context: label) }
+        #endif
+        itemObserverTask?.cancel()
+
+        for await status in item.statusStream {
+""",
+    "4k-exp monitor on initial load",
+)
+
+replace_once(
+    FALLBACK,
+    "            } else if let cached = PlaybackQualityManager.cachedHLSVariants(for: videoId) {\n",
+    "            } else if !fourKActive, let cached = PlaybackQualityManager.cachedHLSVariants(for: videoId) {\n",
+    "4k-exp bypass HLS variant cache",
+)
+
+# Manifest parsing / variant logging in 4K mode.
+replace_once(
+    QUALITY_MANAGER,
+    """        let variants = parseHLSMasterManifest(text, baseURL: url.deletingLastPathComponent())
+""",
+    """        let fourKActive: Bool = TVFourKExperiment.isActive(requestedMaxHeight: effectiveQuality.maxHeight)
+        if fourKActive {
+            let described: [String] = TVFourKExperiment.describeVariants(text)
+            TVFourKExperiment.log("manifest variants (\\(described.count)):")
+            for line in described { TVFourKExperiment.log("  variant \\(line)") }
+        }
+        let variants: [Int: URL] =
+            fourKActive
+            ? parseHLSMasterManifestFourK(text, baseURL: url.deletingLastPathComponent())
+            : parseHLSMasterManifest(text, baseURL: url.deletingLastPathComponent())
+""",
+    "4k-exp manifest parse + log",
+)
+
+# Option 2: composition never picks undecodable AV1 >1080p on tvOS.
+replace_once(
+    QUALITY_MANAGER,
+    """        let videoOnly = formats.filter {
+            $0.mimeType.hasPrefix("video/mp4") && !$0.mimeType.contains(", ") && $0.url != nil
+        }
+        func sortKey(""",
+    """        let videoOnly = formats.filter {
+            $0.mimeType.hasPrefix("video/mp4") && !$0.mimeType.contains(", ") && $0.url != nil
+                && TVFourKExperiment.isFormatDecodable(height: $0.height, mimeType: $0.mimeType)
+        }
+        func sortKey(""",
+    "4k-exp hide undecodable AV1 from composition",
+)
+
+# Monitor quality-switch HLS items in 4K mode.
+replace_once(
+    QUALITY_MANAGER,
+    """        player.replaceCurrentItem(with: item)
+        delegate?.isSwappingItem = false
+    }
+
+    func configureHLSPlayback(""",
+    """        player.replaceCurrentItem(with: item)
+        delegate?.isSwappingItem = false
+        #if os(tvOS)
+        if TVFourKExperiment.isActive(requestedMaxHeight: quality.maxHeight) {
+            TVFourKMonitor.attach(to: item, context: "quality-switch-HLS")
+        }
+        #endif
+    }
+
+    func configureHLSPlayback(""",
+    "4k-exp monitor on quality switch",
+)
+
+replace_once(
+    QUALITY_MANAGER,
+    """        hlsPlaybackMaximumHeight = nil
+        hlsRequiredVideoCodec = nil
+        nativeHLSProxyLoader = nil
+        isMuxedFallback = false
+""",
+    """        hlsPlaybackMaximumHeight = nil
+        hlsRequiredVideoCodec = nil
+        nativeHLSProxyLoader = nil
+        #if os(tvOS)
+        TVFourKMonitor.savedHLSConfig = nil
+        #endif
+        isMuxedFallback = false
+""",
+    "4k-exp reset saved HLS config",
+)
+
+# Quality switch routing: >1080p on tvOS goes through the relaxed HLS master when available;
+# <=1080p restores the exact previous HLS configuration.
+replace_once(
+    QUALITY_MANAGER,
+    quality_route_new,
+    """            #if os(tvOS)
+            if let format, format.height > 1080 {
+                if let hlsURL = self.delegate?.playerInfo?.hlsURL {
+                    if TVFourKMonitor.savedHLSConfig == nil {
+                        TVFourKMonitor.savedHLSConfig = (self.hlsPlaybackMaximumHeight, self.hlsRequiredVideoCodec)
+                    }
+                    TVFourKExperiment.log(
+                        "quality switch → \\(format.height)p via relaxed HLS master client=\\(TVFourKExperiment.lastClientLabel) prev(maxH=\\(self.hlsPlaybackMaximumHeight ?? 0) codec=\\(self.hlsRequiredVideoCodec ?? "nil"))"
+                    )
+                    self.hlsPlaybackMaximumHeight = TVFourKExperiment.uncappedHeight
+                    self.hlsRequiredVideoCodec = TVFourKExperiment.excludeUnsupportedAV1Codec
+                    self.nativeHLSProxyLoader = nil
+                    _ = await self.fetchHLSVariantURLs(url: hlsURL, userAgent: self.hlsPlaybackUserAgent)
+                    await self.reloadHLSItem(seekTo: savedTime, quality: quality)
+                    return
+                }
+                TVFourKExperiment.log(
+                    "quality switch → \\(format.height)p: no HLS URL, using adaptive DASH composition codec=\\(format.mimeType)"
+                )
+                await self.reloadDASHItem(seekTo: savedTime, format: format)
+                return
+            }
+            if let saved = TVFourKMonitor.savedHLSConfig {
+                TVFourKExperiment.log("quality switch → <=1080p: restoring HLS config maxH=\\(saved.maxHeight ?? 0) codec=\\(saved.codec ?? "nil")")
+                self.hlsPlaybackMaximumHeight = saved.maxHeight
+                self.hlsRequiredVideoCodec = saved.codec
+                self.nativeHLSProxyLoader = nil
+                TVFourKMonitor.savedHLSConfig = nil
+            }
+            #endif
+            if self.delegate?.playerInfo?.hlsURL != nil {
+                await self.reloadHLSItem(seekTo: savedTime, quality: quality)
+            } else {
+                await self.reloadDASHItem(seekTo: savedTime, format: format)
+            }""",
+    "4k-exp tvOS quality routing",
+)
+
+# Picker: hide undecodable AV1 >1080p; when an HLS master exists, offer 1440p/2160p entries.
+replace_once(
+    QUALITY_VM,
+    """        #if os(tvOS)
+        if let info = playerInfo {
+            let adaptive = Self.deduplicatedVideoFormats(info.formats)
+            let adaptiveMax = adaptive.map(\\.height).max() ?? 0
+            let hlsMax = availableFormats.map(\\.height).max() ?? 0
+            if adaptiveMax > hlsMax {
+                return adaptive
+            }
+        }
+        #endif
+        return availableFormats""",
+    """        #if os(tvOS)
+        guard let info = playerInfo else { return availableFormats }
+        let adaptive: [VideoFormat] = Self.deduplicatedVideoFormats(info.formats)
+        let adaptiveMax: Int = adaptive.map(\\.height).max() ?? 0
+        let hlsMax: Int = availableFormats.map(\\.height).max() ?? 0
+        let base: [VideoFormat] = adaptiveMax > hlsMax ? adaptive : availableFormats
+        var result: [VideoFormat] = base.filter {
+            TVFourKExperiment.isFormatDecodable(height: $0.height, mimeType: $0.mimeType)
+        }
+        guard let hlsURL = info.hlsURL else { return result }
+        let present: Set<Int> = Set(result.map(\\.height))
+        var highHeights: Set<Int> = []
+        for f in info.formats where f.height > 1080 && f.mimeType.hasPrefix("video/") {
+            if AppSettings.VideoQuality.from(height: f.height) != nil { highHeights.insert(f.height) }
+        }
+        var synthesized: [VideoFormat] = []
+        for h in highHeights.sorted(by: >) where !present.contains(h) {
+            let src: VideoFormat? = info.formats.first { $0.height == h && $0.mimeType.contains("vp09") }
+                ?? info.formats.first { $0.height == h }
+            synthesized.append(
+                VideoFormat(
+                    label: "\\(h)p HLS",
+                    width: src?.width ?? (h * 16 / 9),
+                    height: h,
+                    fps: src?.fps ?? 30,
+                    mimeType: "application/x-mpegURL",
+                    url: hlsURL,
+                    bitrate: src?.bitrate
+                )
+            )
+        }
+        if !synthesized.isEmpty {
+            let higher: [VideoFormat] = result.filter { $0.height > 1080 }
+            let lower: [VideoFormat] = result.filter { $0.height <= 1080 }
+            var merged: [VideoFormat] = higher + synthesized
+            merged.sort { $0.height > $1.height }
+            result = merged + lower
+        }
+        return result
+        #else
+        return availableFormats
+        #endif""",
+    "4k-exp tvOS picker formats",
+)
+
+# On-screen debug text in the tvOS player while the experiment is active.
+replace_once(
+    PLAYER_LIFECYCLE,
+    """                PlayerAVLayerView(player: vm.player, videoGravity: store.settings.videoGravityMode.avGravity)
+                    .ignoresSafeArea()
+                    .accessibilityHidden(true)
+                if vm.isAudioOnlyMode {
+                    audioOnlyThumbnailOverlay
+                }
+                #elseif os(macOS)""",
+    """                PlayerAVLayerView(player: vm.player, videoGravity: store.settings.videoGravityMode.avGravity)
+                    .ignoresSafeArea()
+                    .accessibilityHidden(true)
+                if vm.isAudioOnlyMode {
+                    audioOnlyThumbnailOverlay
+                }
+                TVFourKDebugOverlay(player: vm.player, requestedMaxHeight: vm.effectiveQuality.maxHeight)
+                #elseif os(macOS)""",
+    "4k-exp tvOS debug overlay",
+)
+
 print("tvOS YouTube UI + Chinese titles + 4K quality routing + metadata locale patch complete")
