@@ -113,6 +113,25 @@ jobs:
             DEVELOPMENT_TEAM='' \
             | tee "$RUNNER_TEMP/tvos-build.log"
 
+      - name: Embed tvOS Simplified Chinese host resources
+        if: github.ref == 'refs/heads/feature/tvos-youtube-ui'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DERIVED_DATA="$RUNNER_TEMP/SmartTubeDerivedData"
+          APP_PATH="$DERIVED_DATA/Build/Products/Release-appletvos/Smart Tube.app"
+          test -d "$APP_PATH"
+          mkdir -p "$APP_PATH/zh-Hans.lproj"
+          cp SmartTubeApp/SmartTubeTVApp/zh-Hans.lproj/Localizable.strings \
+             "$APP_PATH/zh-Hans.lproj/Localizable.strings"
+
+          /usr/libexec/PlistBuddy -c 'Delete :CFBundleLocalizations' "$APP_PATH/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleLocalizations array' "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleLocalizations:0 string en' "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleLocalizations:1 string zh-Hans' "$APP_PATH/Info.plist"
+          plutil -lint "$APP_PATH/Info.plist"
+          test -f "$APP_PATH/zh-Hans.lproj/Localizable.strings"
+
       - name: Build and embed Top Shelf extension
         shell: bash
         run: |
