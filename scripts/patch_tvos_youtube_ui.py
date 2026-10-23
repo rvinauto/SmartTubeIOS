@@ -4,6 +4,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ROOT_VIEW = ROOT / "SmartTubeIOS/Sources/SmartTubeIOS/Views/RootView.swift"
 INNER_TUBE = ROOT / "SmartTubeIOS/Sources/SmartTubeIOSCore/InnerTubeAPI.swift"
+HOME_VIEW = ROOT / "SmartTubeIOS/Sources/SmartTubeIOS/Views/Home/HomeView.swift"
+SEARCH_VIEW = ROOT / "SmartTubeIOS/Sources/SmartTubeIOS/Views/Search/SearchView.swift"
+PLAYLIST_VIEW = ROOT / "SmartTubeIOS/Sources/SmartTubeIOS/Views/Browse/PlaylistView.swift"
 
 
 def replace_once(path: Path, old: str, new: str, label: str) -> None:
@@ -25,6 +28,76 @@ replace_once(
     """            #if os(tvOS)\n            TVYouTubeRootView()\n""",
     "tvOS root shell",
 )
+
+# Player presentation must escape the custom sidebar NavigationStack on tvOS.
+home_old = '''            contentArea
+                #if !os(iOS)
+            .navigationDestination(item: $selectedVideo) { video in
+                #if os(macOS)
+                if store.settings.useTOSPlayerOnMac && tosPlayerFallbackVideoId != video.id {
+                    TOSPlayerView(video: video, api: api) {
+                        tosPlayerFallbackVideoId = video.id
+                    }
+                    .environment(store)
+                    .onDisappear { tosPlayerFallbackVideoId = nil }
+                } else {
+                    PlayerView(video: video, api: api)
+                }
+                #else
+                PlayerView(video: video, api: api)
+                #endif
+            }
+                #endif
+                .navigationDestination(item: $selectedPlaylist) { stub in'''
+home_new = '''            contentArea
+                #if os(tvOS)
+            .fullScreenCover(item: $selectedVideo) { video in
+                PlayerView(video: video, api: api)
+                    .ignoresSafeArea()
+            }
+                #elseif os(macOS)
+            .navigationDestination(item: $selectedVideo) { video in
+                if store.settings.useTOSPlayerOnMac && tosPlayerFallbackVideoId != video.id {
+                    TOSPlayerView(video: video, api: api) {
+                        tosPlayerFallbackVideoId = video.id
+                    }
+                    .environment(store)
+                    .onDisappear { tosPlayerFallbackVideoId = nil }
+                } else {
+                    PlayerView(video: video, api: api)
+                }
+            }
+                #endif
+                .navigationDestination(item: $selectedPlaylist) { stub in'''
+replace_once(HOME_VIEW, home_old, home_new, "Home tvOS full-screen player")
+
+search_old = '''        #if os(tvOS)
+        .toolbar(.hidden, for: .navigationBar)
+        .navigationDestination(item: $selectedVideo) { video in
+            PlayerView(video: video, api: api)
+        }
+        #elseif os(iOS)'''
+search_new = '''        #if os(tvOS)
+        .toolbar(.hidden, for: .navigationBar)
+        .fullScreenCover(item: $selectedVideo) { video in
+            PlayerView(video: video, api: api)
+                .ignoresSafeArea()
+        }
+        #elseif os(iOS)'''
+replace_once(SEARCH_VIEW, search_old, search_new, "Search tvOS full-screen player")
+
+playlist_old = '''        #if os(tvOS)
+        .navigationDestination(item: $selectedVideo) { video in
+            PlayerView(video: video, api: api)
+        }
+        #endif'''
+playlist_new = '''        #if os(tvOS)
+        .fullScreenCover(item: $selectedVideo) { video in
+            PlayerView(video: video, api: api)
+                .ignoresSafeArea()
+        }
+        #endif'''
+replace_once(PLAYLIST_VIEW, playlist_old, playlist_new, "Playlist tvOS full-screen player")
 
 api = INNER_TUBE.read_text(encoding="utf-8")
 helper_marker = 'private let tubeLog = Logger(subsystem: appSubsystem, category: "InnerTube")\n'
@@ -109,4 +182,4 @@ else:
     print("TV metadata locale: already applied")
 
 INNER_TUBE.write_text(api, encoding="utf-8")
-print("tvOS YouTube UI + metadata locale patch complete")
+print("tvOS YouTube UI + metadata locale + full-screen patch complete")
