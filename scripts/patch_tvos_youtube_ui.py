@@ -200,35 +200,38 @@ chip_button_old = '''        return Button(action: action) {
         .accessibilityLabel(section.title)
         .accessibilityIdentifier("chip.\\(section.title)")
         .focused($focusedSection, equals: section)'''
-chip_button_new = '''        return Button(action: action) {
-            Text(section.title)
-                .font(.callout.weight(isSelected ? .semibold : .medium))
+chip_button_new = '''        // Pre-compute styling with explicit types so the Swift type checker does not time out.
+        let chipHighlighted: Bool = isSelected || isFocused
+        let chipFont: Font = .callout.weight(isSelected ? .semibold : .medium)
+        let chipForeground: Color = Color.white.opacity(chipHighlighted ? 1.0 : 0.72)
+        let chipFillOpacity: Double = isSelected ? 0.16 : (isFocused ? 0.10 : 0.045)
+        let chipFill: Color = Color.white.opacity(chipFillOpacity)
+        let chipStroke: Color = isFocused ? Color.white.opacity(0.34) : Color.clear
+        let chipScale: CGFloat = isFocused ? 1.025 : 1.0
+        let chipTitle: String = section.title
+        let chipLabel: AnyView = AnyView(
+            Text(chipTitle)
+                .font(chipFont)
                 .lineLimit(1)
                 .padding(.horizontal, 18)
                 .frame(height: 44)
-                .foregroundStyle(Color.white.opacity(isSelected || isFocused ? 1.0 : 0.72))
-                .background(
-                    Capsule()
-                        .fill(
-                            isSelected
-                                ? Color.white.opacity(0.16)
-                                : (isFocused ? Color.white.opacity(0.10) : Color.white.opacity(0.045))
-                        )
-                )
-                .overlay(
-                    Capsule()
-                        .stroke(isFocused ? Color.white.opacity(0.34) : Color.clear, lineWidth: 1.5)
-                )
+                .foregroundStyle(chipForeground)
+                .background(Capsule().fill(chipFill))
+                .overlay(Capsule().stroke(chipStroke, lineWidth: 1.5))
                 .focusEffectDisabled()
-        }
-        .buttonStyle(.plain)
-        .focusEffectDisabled()
-        .scaleEffect(isFocused ? 1.025 : 1.0)
+        )
+        let chipCore: AnyView = AnyView(
+            Button(action: action) { chipLabel }
+                .buttonStyle(.plain)
+                .focusEffectDisabled()
+                .scaleEffect(chipScale)
+        )
+        return chipCore
         .animation(.easeOut(duration: 0.10), value: focusedSection)
         .animation(.easeInOut(duration: 0.12), value: selectedSection)
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
-        .accessibilityLabel(section.title)
-        .accessibilityIdentifier("chip.\\(section.title)")
+        .accessibilityLabel(chipTitle)
+        .accessibilityIdentifier("chip.\\(chipTitle)")
         .focused($focusedSection, equals: section)'''
 replace_once(HOME_VIEW, chip_button_old, chip_button_new, "compact tvOS home chips")
 
