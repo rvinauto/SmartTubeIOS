@@ -531,6 +531,52 @@ public enum TVFourKExperiment {
     }()
 
     nonisolated(unsafe) public static var lastClientLabel: String = ""
+    /// Highest variant offered by the original master (e.g. "3840x2160 vp09.00.51.08").
+    nonisolated(unsafe) public static var offeredTopVariant: String = "-"
+    nonisolated(unsafe) public static var offeredVariantCount: Int = 0
+    /// Variants actually handed to AVPlayer after 4K-mode filtering.
+    nonisolated(unsafe) public static var handedTopVariant: String = "-"
+    nonisolated(unsafe) public static var handedVariantCount: Int = 0
+    nonisolated(unsafe) public static var handedMode: String = "-"
+
+    static func topVariant(_ manifest: String) -> (count: Int, top: String) {
+        var count = 0
+        var bestH = -1
+        var best = "-"
+        for raw in manifest.components(separatedBy: .newlines) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("#EXT-X-STREAM-INF") else { continue }
+            count += 1
+            let res = line.range(of: #"RESOLUTION=\d+x\d+"#, options: .regularExpression)
+                .map { String(line[$0].dropFirst("RESOLUTION=".count)) } ?? "?"
+            let h = res.components(separatedBy: "x").last.flatMap { Int($0) } ?? 0
+            let codecs = line.range(of: #"CODECS="[^",]*"#, options: .regularExpression)
+                .map { String(line[$0].dropFirst("CODECS=\"".count)) } ?? "?"
+            if h > bestH { bestH = h; best = "\(res) \(codecs)" }
+        }
+        return (count, best)
+    }
+
+    /// 4K-mode master rewrite used by the HLS proxy. To get a decisive answer on whether
+    /// AVPlayer accepts VP9 HLS, serve only VP9/HEVC variants (plus AV1 when HW-decodable).
+    /// If none exist, fall back to the "drop unsupported AV1 only" master (H.264 kept).
+    public static func filterMasterForFourK(_ manifest: String) -> String {
+        let offered = topVariant(manifest)
+        offeredVariantCount = offered.count
+        offeredTopVariant = offered.top
+        var high = filterHLSMasterManifest(manifest, maximumHeight: uncappedHeight, requiredVideoCodec: "vp09")
+        var mode = "vp09-only"
+        if topVariant(high).count == 0 {
+            high = filterHLSMasterManifest(manifest, maximumHeight: uncappedHeight, requiredVideoCodec: excludeUnsupportedAV1Codec)
+            mode = "no-vp09→all-but-unsupported-av01"
+        }
+        let handed = topVariant(high)
+        handedVariantCount = handed.count
+        handedTopVariant = handed.top
+        handedMode = mode
+        log("proxy master: offered=\(offered.count) top=\(offered.top) → handed=\(handed.count) top=\(handed.top) mode=\(mode)")
+        return high
+    }
 
     public static func log(_ message: String) {
         logger.notice("[4k-exp] \(message, privacy: .public)")
@@ -715,6 +761,8 @@ struct TVFourKDebugOverlay: View {
         var lines: [String] = []
         lines.append("[4k-exp] req=\(req) client=\(TVFourKExperiment.lastClientLabel)")
         lines.append(TVFourKMonitor.describe(player.currentItem))
+        lines.append("offered=\(TVFourKExperiment.offeredVariantCount) top=\(TVFourKExperiment.offeredTopVariant)")
+        lines.append("handed=\(TVFourKExperiment.handedVariantCount) top=\(TVFourKExperiment.handedTopVariant) mode=\(TVFourKExperiment.handedMode)")
         lines.append("AV1 HW=\(TVFourKExperiment.av1HardwareDecodeSupported ? "yes" : "no")")
         if !TVFourKMonitor.lastError.isEmpty {
             lines.append("err=\(String(TVFourKMonitor.lastError.prefix(120)))")
@@ -808,6 +856,26 @@ replace_once(
     "            } else if let cached = PlaybackQualityManager.cachedHLSVariants(for: videoId) {\n",
     "            } else if !fourKActive, let cached = PlaybackQualityManager.cachedHLSVariants(for: videoId) {\n",
     "4k-exp bypass HLS variant cache",
+)
+
+replace_once(
+    ROOT / "SmartTubeIOS/Sources/SmartTubeIOS/Services/YTHLSProxyLoader.swift",
+    """            text = filterHLSMasterManifest(
+                text,
+                maximumHeight: maximumVideoHeight,
+                requiredVideoCodec: requiredVideoCodec
+            )
+""",
+    """            text =
+                requiredVideoCodec == TVFourKExperiment.excludeUnsupportedAV1Codec
+                ? TVFourKExperiment.filterMasterForFourK(text)
+                : filterHLSMasterManifest(
+                    text,
+                    maximumHeight: maximumVideoHeight,
+                    requiredVideoCodec: requiredVideoCodec
+                )
+""",
+    "4k-exp proxy master rewrite",
 )
 
 # Manifest parsing / variant logging in 4K mode.
